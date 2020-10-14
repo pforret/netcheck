@@ -1,42 +1,24 @@
 #!/usr/bin/env bash
-### ==============================================================================
-### SO HOW DO YOU PROCEED WITH YOUR SCRIPT?
-### 1. define the options/parameters and defaults you need in list_options()
-### 2. implement the different actions in main() with helper functions
-### 3. implement helper functions you defined in previous step
-### 4. add binaries your script needs (e.g. ffmpeg, jq) to verify_programs
-### ==============================================================================
-
-### Created by author_name ( author_username ) on meta_thisday
+### Created by Peter Forret ( pforret ) on 2020-10-15
 script_version="0.0.0"  # if there is a VERSION.md in this script's folder, it will take priority for version number
-readonly script_author="author@email.com"
-readonly script_creation="meta_thisday"
+readonly script_author="peter@forret.com"
+readonly script_creation="2020-10-15"
 readonly run_as_root=-1 # run_as_root: 0 = don't check anything / 1 = script MUST run as root / -1 = script MAY NOT run as root
 
 list_options() {
-  ### Change the next lines to reflect which flags/options/parameters you need
-  ### flag:   switch a flag 'on' / no extra parameter
-  ###     flag|<short>|<long>|<description>
-  ###     e.g. "-v" or "--verbose" for verbose output / default is always 'off'
-  ### option: set an option value / 1 extra parameter
-  ###     option|<short>|<long>|<description>|<default>
-  ###     e.g. "-e <extension>" or "--extension <extension>" for a file extension
-  ### param:  comes after the options
-  ###     param|<type>|<long>|<description>
-  ###     <type> = 1 for single parameters - e.g. param|1|output expects 1 parameter <output>
-  ###     <type> = n for list parameter    - e.g. param|n|inputs expects <input1> <input2> ... <input99>
 echo -n "
 #commented lines will be filtered
 flag|h|help|show usage
 flag|q|quiet|no output
 flag|v|verbose|output more
 flag|f|force|do not ask for confirmation (always yes)
-option|l|log_dir|folder for log files |log
-option|t|tmp_dir|folder for temp files|.tmp
-param|1|action|action to perform: action1/action2/...
-# there can only be 1 param|n and it should be the last
-param|1|input|input file
-param|1|output|output file
+flag|r|rx|check for tx/rx traffic too
+option|d|domain|domain to check for|www.google.com
+option|n|ns|nameserver to use as fallback|8.8.8.8
+option|p|port|port to check for|80
+option|t|tmp_dir|folder for temporary files|.tmp
+option|l|log_dir|folder for log files|log
+param|1|action|action to perform: check/...
 " | grep -v '^#'
 }
 
@@ -52,15 +34,27 @@ main() {
     verify_programs awk basename cut date dirname find grep head mkdir sed stat tput uname wc
     prep_log_and_temp_dir
 
+    problems_found=0
+    fatal_problem=0
+
     action=$(lower_case "$action")
     case $action in
-    action1 )
+    check )
         # shellcheck disable=SC2154
-        perform_action1 "$input" "$output"
-        ;;
+        chapter "CHECK NETWORK CARDS" "is your machine connected via wifi or cable?"
+        [[ $fatal_problem -eq 0 ]] && default_interface
+        [[ $fatal_problem -eq 0 ]] && check_local
 
-    action2 )
-        perform_action2 "$input" "$output"
+        chapter "CHECK NETWORK CONNECTIONS" "does your gateway respond?"
+        [[ $fatal_problem -eq 0 ]] && check_allif
+
+        chapter "CHECK DNS RESOLUTION" "can you reach the internet?"
+        [[ $fatal_problem -eq 0 ]] && check_alldns
+
+        chapter "CHECK HTTP TRAFFIC" "can you access the web?"
+        [[ $fatal_problem -eq 0 ]] && check_conn
+        
+        chapter "PROBLEMS FOUND: $problems_found" ""
         ;;
 
     *)
@@ -72,16 +66,261 @@ main() {
 ## Put your helper scripts here
 #####################################################################
 
-perform_action1(){
-  echo "ACTION 1"
-  # < "$1"  do_stuff > "$2"
+default_interface(){
+  defaultif=$(netstat -nr | grep ^0.0.0.0 | awk '{print $8}' | head -1)
+  if [ -z "$defaultif" ] ; then
+    defaultif=none
+    alert "WARN: This system does not have a default route"
+    problems_found=$((problems_found + 1))
+  elif [ $(netstat -nr | grep ^0.0.0.0 | wc -l) -gt 1 ] ; then
+    alert "WARN: This system has more than one default route"
+    problems_found=$((problems_found + 1))
+  else 
+    success "This system has a default route, interface <$defaultif>"
+  fi
 }
 
-perform_action2(){
-  echo "ACTION 2"
-  # < "$1"  do_other_stuff > "$2"
+ping_host () {
+  [[ -z "${1:-}" ]] && return 1
+  host="$1"
+  count=10
+  [[ -n "${2:-}" ]] && count="$2"
+  ping -q -c $count "$host" >/dev/null 2>&1 
+  if [ "$?" -ne 0 ]; then
+    log "WARN: Host <$host> does not answer to ICMP pings"
+    return 1
+  else
+    log "Host <$host> answers to ICMP pings"
+  fi
+  return 0
 }
 
+check_router () {
+  [[ -z "${1:-}" ]] && return 1
+  router="$1"
+  ping_host "$router" 3
+  if [ "$?" -ne 0 ]; then
+    alert "WARN: Router <$router> does not answer to ICMP pings"
+    routerarp=`arp -n | grep "^$router" | grep -v incomplete`
+    if [[ -z "$routerarp" ]] ; then
+      alert "ERR: We cannot retrieve a MAC address for router $router"
+      problems_found=$((problems_found + 1))
+      return 1
+    fi
+    problems_found=$((problems_found + 1))
+    return 1
+  fi
+  success "The router <$router> is reachable"
+  return 0
+}
+
+check_local () {
+  if [[ -z $(ifconfig | grep Link | grep lo) ]] ; then
+    alert "ERR: There is no loopback interface in this system"
+    problems_found=$(expr $problems_found + 1)
+    return 1
+  fi
+  if ! ping_host 127.0.0.1 1 > /dev/null ; then
+    alert "Cannot ping localhost (127.0.0.1), loopback is broken in this system"
+    problems_found=$(expr $problems_found + 1)
+    return 1
+  fi
+  if ! ping_host localhost 1 > /dev/null; then
+    alert "check /etc/hosts and verify localhost points to 127.0.0.1"
+    problems_found=$(expr $problems_found + 1)
+    return 1
+  fi
+  success "Loopback interface is working properly"
+  return 0
+}
+
+check_netroute () {
+  ifname="$1"
+  [[ -z "$ifname" ]] && return 1
+  netstat -nr  | grep "${ifname}$" \
+  | while read -r network gw netmask flags mss window irtt iface; do
+    # For each gw that is not the default one, ping it
+    if [[ "$gw" != "0.0.0.0" && "$gw" != "" ]] ; then
+      log "check gateway $gw ..."
+      if ! check_router $gw  ; then
+        alert "ERR: The default route is not available since the default router <$gw> is unreachable"
+      else
+        out "Gateway $gw is reachable"
+      fi
+    fi
+  done
+}
+
+check_if () {
+  ifname=$1
+  status=0
+  [ -z "$ifname" ] && return 1
+  # Find IP addresses for $ifname
+  inetaddr=$(ip addr show $ifname| awk '/inet / {print $2}')
+  if [[ -z "$inetaddr" ]] ; then
+    alert "WARN: Interface <$ifname>: no IP address assigned"
+    problems_found=$(expr $problems_found + 1)
+    return 1
+  fi
+  echo $inetaddr | while read -r ipaddr; do
+    success "Interface <$ifname>: IP address(es) <$ipaddr>"
+  done
+
+  ip route show \
+  | grep "$ifname" \
+  | awk '$1 == "default" {print $3} $2 == "default" {print $4}' \
+  | while read -r gateway ; do
+      success "Gateway for <$ifname>: <$gateway>"
+    done
+  
+  (( $rx )) && (
+    txpkts=`ifconfig $ifname | awk '/TX packets/ { print $2 }' |sed 's/.*://'`
+    rxpkts=`ifconfig $ifname | awk '/RX packets/ { print $2 }' |sed 's/.*://'`
+    txerrors=`ifconfig $ifname | awk '/TX packets/ { print $3 }' |sed 's/.*://'`
+    rxerrors=`ifconfig $ifname | awk '/RX packets/ { print $3 }' |sed 's/.*://'`
+
+    if [[ "$txpkts" -eq 0 ]] && [[ "$rxpkts" -eq 0 ]] ; then
+      alert "ERR: Interface <$ifname>: has not tx or rx any packets. Link down?"
+      problems_found=$(( $problems_found + 1))
+      return 1
+    elif [[ "$txpkts" -eq 0 ]] ; then
+      alert "WARN: Interface <$ifname>: has not transmitted any packets."
+    elif [ "$rxpkts" -eq 0 ] ; then
+      alert "WARN: Interface <$ifname>: has not received any packets."
+    else
+      log "Interface <$ifname>: has tx and rx packets."
+    fi
+
+    if [ "$txerrors" -ne 0 ]; then
+      echo "WARN: Interface <$ifname>: has tx errors."
+      problems_found=$(( $problems_found + 1))
+      return 1
+    fi
+    if [ "$rxerrors" -ne 0 ]; then
+      echo "WARN: Interface <$ifname>: has rx errors."
+      problems_found=$(( $problems_found + 1))
+      return 1
+    fi
+    )
+  return 0
+}
+
+check_allif () {
+  status=0
+  iffound=0
+  ifok=0
+  ifnames=$(ip link show | awk -F: '$1 > 0 { gsub(/ /,"",$2); print $2}')
+  for ifname in $ifnames ; do
+    #ifname=$(echo $ifname | sed -e 's/:$//')
+    [[ $ifname == lo ]] && continue
+    iffound=$(( iffound +1 ))
+    if [ -z "$(ifconfig $ifname | grep UP)" ] ; then
+      if  [ "$ifname" = "$defaultif" ] ; then
+        alert "ERR: Interface <$ifname>: default route is down!"
+        status=1
+      elif  [ "$ifname" = "lo"  ] ; then
+        alert "ERR: Interface <$ifname>: is down, this might cause issues with local applications"
+      else
+        log "WARN: Interface <$ifname>: is down"
+      fi
+    else
+    # Check network routes associated with this interface
+      log "Interface <$ifname>: is up!"
+      if check_if $ifname ; then
+        if check_netroute $ifname ; then
+          ifok=$(( ifok +1 ))
+        fi
+      fi
+    fi
+  done
+  log "Interface: $ifok of $iffound interfaces are OK"
+  if [[ $ifok -lt 1 ]] ;  then
+    fatal_problem=1
+    problems_found=$(( problems_found + 1))
+  fi
+  return $status
+}
+
+check_ns(){
+  nameserver=$1
+  [[ -z "$nameserver" ]] && return 1
+  lookuplast=`host -W 5 $domain $nameserver 2>&1 | tail -1`
+  log "$domain@$nameserver: '$lookuplast'"
+
+  if [[ -n $(echo $lookuplast | grep NXDOMAIN) ]] ; then
+    # example: host www.google.comp 8.8.8.8
+    log "ERR: DNS <$nameserver>: domain <$domain> could not be resolved"
+    problems_found=$(expr $problems_found + 1)
+    return 1
+  fi
+
+  if [[ -n $(echo $lookuplast | grep "timed out") ]] ; then
+    # example: host www.google.com 8.8.8.7
+    log "ERR: DNS <$nameserver>: NS server does not respond"
+    problems_found=$(expr $problems_found + 1)
+    return 1
+  fi
+  ipaddresses=$(host -W 5 $domain $nameserver | grep has | awk '/address/ {print $NF}')
+  for ipaddress in $ipaddresses ; do
+    success "DNS <$nameserver>: resolves <$domain> to <$ipaddress>"
+  done
+}
+
+check_alldns(){
+  status=1
+  nsfound=0
+  nsok=0
+  nameservers=$( cat /etc/resolv.conf | grep nameserver | awk '{print $2}')
+  if ! check_ns $ns ; then
+    alert "ERR: DNS <$ns>: cannot resolve <$domain>"
+    problems_found=$(expr $problems_found + 1)
+    return 1    
+  fi
+  for nameserver in $nameservers ;  do
+    nsfound=$(( $nsfound + 1 ))
+    log "DNS <$nameserver>: used as nameserver"
+    if ping_host $nameserver 5 ; then
+      if check_ns $nameserver ; then
+        nsok=$(( $nsok +1 ))
+      else
+        problems_found=$(expr $problems_found + 1)
+        status=$?
+      fi
+    fi
+  done
+  log "DNS: $nsok of $nsfound nameservers are OK"
+  if [[ $nsok -lt 1 ]] ;  then
+    fatal_problem=1
+    problems_found=$(expr $problems_found + 1)
+  fi
+
+}
+
+check_conn () {
+# Checks network connectivity
+  if ! ping_host $domain ; then
+    alert "WARN: Host <$domain>: cannot be reached by ICMP ping"
+    problems_found=$(expr $problems_found + 1)
+  else
+    success "Host <$domain>: can be reached by ICMP ping"
+  fi
+# Check web access, using nc
+  httpversion=$(echo -e "HEAD / HTTP/1.0\n\n" | nc $domain $port 2>/dev/null  | grep HTTP)
+  if [ $? -ne 0 ] ; then
+    alert "WARN: Host <$domain:$port>: no response"
+    problems_found=$(expr $problems_found + 1)
+  else
+    success "Host <$domain:$port>: web server responds!"
+  fi
+}
+
+chapter () {
+  out "\n## $1"
+  if [[ "$2" != "" ]] ; then
+    out "-- $2"
+  fi
+
+}
 
 #####################################################################
 ################### DO NOT MODIFY BELOW THIS LINE ###################
